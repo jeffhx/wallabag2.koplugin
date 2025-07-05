@@ -470,67 +470,65 @@ function WallabagX:getArticleList()
 
     local article_list = {}
     local page = 1
-    -- query the server for articles until we hit our target number
-    -- FIXME this is horrible, use the 2.4+ API to know when we've ran out
-    -- https://github.com/koreader/koreader/issues/10738 issue #10738
+    local per_page = math.min(100, self.articles_per_sync * 2) -- Use larger page size for fewer requests
+    local total_articles = nil
+    local total_pages = nil
+    
     while #article_list < self.articles_per_sync do
-        -- get the JSON containing the article list
+        -- Optimize API call with larger perPage and sorting
         local articles_url = "/api/entries?archive=0"
                           .. "&detail=metadata"
+                          .. "&sort=updated&order=desc"
                           .. "&page=" .. page
-                          .. "&perPage=" .. self.articles_per_sync
+                          .. "&perPage=" .. per_page
                           .. filtering
         local articles_json, err, code = self:callAPI("GET", articles_url, nil, "", "", true)
 
         if err == "http_error" and code == 404 then
-            -- we may have hit the last page, there are no more articles
             logger.dbg("WallabagX: couldn't get page #", page)
-            break -- exit while loop
+            break
         elseif err or articles_json == nil then
-            -- another error has occured. Don't proceed with downloading
-            -- or deleting articles
             logger.warn("WallabagX: download of page #", page, "failed with", err, code)
             UIManager:show(InfoMessage:new{
                 text = _("Requesting article list failed."), })
             return
         end
 
-        -- We're only interested in the actual articles in the JSON
-        -- build an array of those so it's easier to manipulate later
-        local new_article_list = {}
-        for _, article in ipairs(articles_json._embedded.items) do
-            table.insert(new_article_list, article)
+        -- Cache total info from first response
+        if total_articles == nil then
+            total_articles = articles_json.total or 0
+            total_pages = articles_json.pages or 1
+            logger.dbg("WallabagX: server has", total_articles, "articles across", total_pages, "pages")
         end
 
-        -- Apply the filters
-        new_article_list = self:filterIgnoredTags(new_article_list)
+        -- Early termination checks
+        if not articles_json._embedded or not articles_json._embedded.items then
+            logger.dbg("WallabagX: no articles in response")
+            break
+        end
 
-        -- Append the filtered list to the final article list
-        for _, article in ipairs(new_article_list) do
-            if #article_list == self.articles_per_sync then
+        -- Process articles directly without intermediate array
+        local filtered_articles = self:filterIgnoredTags(articles_json._embedded.items)
+        
+        -- Add filtered articles to final list
+        for _, article in ipairs(filtered_articles) do
+            if #article_list >= self.articles_per_sync then
                 logger.dbg("WallabagX: hit the article target", self.articles_per_sync)
                 break
             end
             table.insert(article_list, article)
         end
 
-        -- TODO add sanity check for articles_json.total field being present and a number
-        -- logger.warn("WallabagX: download of page #", page, "failed with", err, code)
-        -- UIManager:show(InfoMessage:new{ text = _("Requesting article list failed."), })
-        -- return
-        if #article_list >= articles_json.total then
-            -- we now have more articles than the server has available
-            logger.dbg("WallabagX: no more articles to query server for", articles_json.total)
-            break;
+        -- Optimized termination conditions
+        if #article_list >= total_articles or page >= total_pages then
+            logger.dbg("WallabagX: reached end of available articles")
+            break
         end
-        if page >= articles_json.pages then
-            -- no more pages of results on server
-            logger.dbg("WallabagX: no more pages of articles to query server for", articles_json.total)
-            break;
-        end
+        
         page = page + 1
     end
 
+    logger.dbg("WallabagX: collected", #article_list, "articles after filtering")
     return article_list
 end
 
