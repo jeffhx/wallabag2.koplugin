@@ -107,6 +107,12 @@ function WallabagX:init()
     self.remove_finished_from_history = self.wb_settings.data.wallabag.remove_finished_from_history or false
     self.download_queue = self.wb_settings.data.wallabag.download_queue or {}
 
+    -- pagination state for load next page functionality
+    self.current_page = 1
+    self.total_pages = 0
+    self.has_more_pages = false
+    self.last_sync_articles = {}
+
     -- workaround for dateparser only available if newsdownloader is active
     self.is_dateparser_available = false
     self.is_dateparser_checked = false
@@ -141,6 +147,15 @@ function WallabagX:addToMainMenu(menu_items)
                 text = _("Retrieve new articles from server"),
                 callback = function()
                     self.ui:handleEvent(Event:new("SynchronizeWallabagX"))
+                end,
+            },
+            {
+                text = _("Load next page of articles"),
+                callback = function()
+                    self.ui:handleEvent(Event:new("LoadNextPageWallabagX"))
+                end,
+                enabled_func = function()
+                    return self.has_more_pages
                 end,
             },
             {
@@ -499,6 +514,11 @@ function WallabagX:getArticleList()
             total_articles = articles_json.total or 0
             total_pages = articles_json.pages or 1
             logger.dbg("WallabagX: server has", total_articles, "articles across", total_pages, "pages")
+            
+            -- Update pagination state
+            self.current_page = 1
+            self.total_pages = total_pages
+            self.has_more_pages = total_pages > 1
         end
 
         -- Early termination checks
@@ -1207,6 +1227,104 @@ end
 function WallabagX:onSynchronizeWallabagX()
     local connect_callback = function()
         self:synchronize()
+        self:refreshCurrentDirIfNeeded()
+    end
+    NetworkMgr:runWhenOnline(connect_callback)
+
+    -- stop propagation
+    return true
+end
+
+function WallabagX:loadNextPage()
+    if not self.has_more_pages then
+        UIManager:show(InfoMessage:new{
+            text = _("No more pages available")
+        })
+        return
+    end
+
+    local info = InfoMessage:new{ text = _("Loading next page…") }
+    UIManager:show(info)
+    UIManager:forceRePaint()
+    UIManager:close(info)
+
+    if self:getBearerToken() == false then
+        return false
+    end
+
+    local filtering = ""
+    if self.filter_tag ~= "" then
+        filtering = "&tags=" .. self.filter_tag
+    end
+
+    local per_page = math.min(100, self.articles_per_sync * 2)
+    local next_page = self.current_page + 1
+    
+    local articles_url = "/api/entries?archive=0"
+                      .. "&detail=metadata"
+                      .. "&sort=updated&order=desc"
+                      .. "&page=" .. next_page
+                      .. "&perPage=" .. per_page
+                      .. filtering
+    
+    local articles_json, err, code = self:callAPI("GET", articles_url, nil, "", "", true)
+    
+    if err or articles_json == nil then
+        UIManager:show(InfoMessage:new{
+            text = _("Failed to load next page")
+        })
+        return
+    end
+
+    if not articles_json._embedded or not articles_json._embedded.items then
+        UIManager:show(InfoMessage:new{
+            text = _("No more articles available")
+        })
+        self.has_more_pages = false
+        return
+    end
+
+    local filtered_articles = self:filterIgnoredTags(articles_json._embedded.items)
+    local downloaded_count = 0
+    local failed_count = 0
+    
+    info = InfoMessage:new{ text = _("Downloading articles…") }
+    UIManager:show(info)
+    UIManager:forceRePaint()
+    UIManager:close(info)
+
+    for _, article in ipairs(filtered_articles) do
+        local res = self:download(article)
+        if res == downloaded then
+            downloaded_count = downloaded_count + 1
+        elseif res == failed then
+            failed_count = failed_count + 1
+        end
+    end
+
+    -- Update pagination state
+    self.current_page = next_page
+    self.total_pages = articles_json.pages or self.total_pages
+    self.has_more_pages = next_page < self.total_pages
+
+    local msg_text
+    if failed_count > 0 then
+        msg_text = T(_("Page %1 loaded.\nDownloaded: %2\nFailed: %3"), next_page, downloaded_count, failed_count)
+    else
+        msg_text = T(_("Page %1 loaded.\nDownloaded: %2"), next_page, downloaded_count)
+    end
+    
+    if not self.has_more_pages then
+        msg_text = msg_text .. "\n" .. _("No more pages available")
+    end
+    
+    UIManager:show(InfoMessage:new{ text = msg_text })
+    return true
+end
+
+function WallabagX:onLoadNextPageWallabagX()
+    local connect_callback = function()
+        self:loadNextPage()
         self:refreshCurrentDirIfNeeded()
     end
     NetworkMgr:runWhenOnline(connect_callback)
